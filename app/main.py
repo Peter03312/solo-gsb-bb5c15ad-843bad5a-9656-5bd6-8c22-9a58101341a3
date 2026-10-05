@@ -15,6 +15,7 @@ from .schemas import (
     BatchVerifyResponse,
     CancelOut,
     CancelRequest,
+    CurrentVerificationOut,
     LicenseCreate,
     LicenseOut,
     OpeningCodeOut,
@@ -23,6 +24,8 @@ from .schemas import (
     PoolOut,
     RedeemRequest,
     RedemptionOut,
+    RescheduleOut,
+    RescheduleRequest,
     RevokeOut,
     RevokeRequest,
     SuspensionCreate,
@@ -72,8 +75,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.4.0",
-        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消与一次性开场码领取/核销",
+        version="1.5.0",
+        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消、一次性开场码领取/核销与核准场次改签",
         lifespan=lifespan,
     )
     app.state.store = store
@@ -106,7 +109,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def root():
         return {
             "service": "film-festival-licensing",
-            "version": "1.4.0",
+            "version": "1.5.0",
             "docs": "/docs",
             "health": "/health",
         }
@@ -286,7 +289,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         )
         return {"count": len(results), "results": results}
 
-    @app.get("/verifications", response_model=list[VerificationOut], tags=["verifications"])
+    @app.get("/verifications", response_model=list[CurrentVerificationOut], tags=["verifications"])
     def list_verifications(
         film_id: Optional[str] = Query(default=None),
         venue_id: Optional[str] = Query(default=None),
@@ -307,11 +310,71 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.get(
         "/verifications/{idempotency_key}",
-        response_model=VerificationOut,
+        response_model=CurrentVerificationOut,
         tags=["verifications"],
     )
     def get_verification(idempotency_key: str):
+        """按原核验幂等键查询单条核验记录的**当前排片**（含改签/取消状态）。"""
         return store.get_verification(idempotency_key)
+
+    @app.post(
+        "/verifications/{idempotency_key}/reschedule",
+        response_model=RescheduleOut,
+        tags=["verifications"],
+    )
+    def reschedule_verification(idempotency_key: str, body: RescheduleRequest):
+        """运营方将核准场次改签到同一影片与场馆的新开场时间（幂等）。
+
+        - 门槛：仅**尚未开场、未取消、未领取开场码**的核准场次可改签；新时间须
+          晚于当前时刻且不同于当前排片；未知键 404，已拒绝 422
+          VERIFICATION_NOT_APPROVED，已取消 422 SESSION_CANCELLED，已开场 422
+          SESSION_ALREADY_STARTED，已领开场码 422 OPENING_CODE_ALREADY_ISSUED，
+          新时间非未来 422 NEW_START_NOT_IN_FUTURE，与当前相同 422
+          NEW_START_UNCHANGED，均不留改签记录；
+        - 每次改签都按新时间**重新判定**授权/暂停/撤销与所绑共享池额度，当前占用
+          视为先释放后参与可用额度；无法核准时返回**既有拒绝原因**
+          （decision=rejected），排片与占用不变，并落一条可追溯、可幂等重放的
+          改签流水；
+        - 成功后原授权及池占用各释放一次、新授权及池占用各增加一次；保留改签历史，
+          GET /verifications 返回当前排片；
+        - 同操作键同内容重放返回首次记录（replay=true，不重复迁移），同操作键异
+          内容（或用于另一核验）返回 409；
+        - 后续取消/领码/核销均按当前排片与当前授权处理；原核验决定与快照不变。
+        """
+        return store.reschedule_verification(
+            idempotency_key,
+            new_start_time=body.new_start_time,
+            operation_key=body.operation_key,
+            reason=body.reason,
+        )
+
+    @app.get(
+        "/reschedules",
+        response_model=list[RescheduleOut],
+        tags=["verifications"],
+    )
+    def list_reschedules(
+        idempotency_key: Optional[str] = Query(default=None),
+        operation_key: Optional[str] = Query(default=None),
+        decision: Optional[str] = Query(default=None, pattern="^(approved|rejected)$"),
+        limit: int = Query(default=200, ge=1, le=1000),
+    ):
+        """改签历史（含被拒但已留痕的改签），可按原核验键/操作键/决定过滤。"""
+        return store.list_reschedules(
+            idempotency_key=idempotency_key,
+            operation_key=operation_key,
+            decision=decision,
+            limit=limit,
+        )
+
+    @app.get(
+        "/reschedules/{reschedule_id}",
+        response_model=RescheduleOut,
+        tags=["verifications"],
+    )
+    def get_reschedule(reschedule_id: int):
+        """按改签记录编号查询单条改签记录。"""
+        return store.get_reschedule(reschedule_id)
 
     @app.post(
         "/verifications/{idempotency_key}/cancel",

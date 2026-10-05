@@ -96,6 +96,37 @@ CREATE TABLE IF NOT EXISTS redemptions (
     venue_id        TEXT    NOT NULL,             -- 核销场馆编号（须与核准场馆一致）
     redeemed_at     TEXT    NOT NULL
 );
+
+-- 排片改签：运营方凭原核验幂等键 + 改签操作键，把尚未开场、未取消、未领开场码
+-- 的核准场次改到同一影片+场馆的新开场时间。原核验行（决定/快照/占用归属）保持
+-- 原样不变；当前排片与实时额度归属由"最近一条成功改签"派生（见 service 层
+-- COALESCE 子查询）。operation_key 全库唯一：同键同内容重放不重复迁移，
+-- 同键异内容冲突。业务上无法核准的改签同样落一条 decision='rejected' 流水，
+-- 排片与占用不变且可按操作键幂等重放。
+CREATE TABLE IF NOT EXISTS reschedules (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id INTEGER NOT NULL REFERENCES verifications (id),
+    idempotency_key TEXT    NOT NULL,             -- 冗余原核验幂等键，便于按键查询
+    operation_key   TEXT    NOT NULL UNIQUE,      -- 改签操作键：同键同内容重放，异内容 409
+    request_hash    TEXT    NOT NULL,             -- 原核验键 + 新开场时间的内容指纹
+    from_start_time TEXT    NOT NULL,             -- 改签前的当前开场时刻
+    to_start_time   TEXT    NOT NULL,             -- 改签请求的新开场时刻（被拒也留痕）
+    from_license_id INTEGER,                      -- 改签前占用的授权（释放一次）
+    to_license_id   INTEGER,                      -- 改签后新占用的授权（新增一次）；被拒为 NULL
+    from_pool_id    INTEGER,                      -- 改签前占用的共享池（释放一次）
+    to_pool_id      INTEGER,                      -- 改签后新占用的共享池；未绑池/被拒为 NULL
+    new_remaining_quota INTEGER,                  -- 新授权占用后的自身剩余快照；被拒为 NULL
+    new_pool_remaining_quota INTEGER,             -- 新池占用后的剩余快照；无池/被拒为 NULL
+    decision        TEXT    NOT NULL CHECK (decision IN ('approved', 'rejected')),
+    reject_reason   TEXT,                         -- 无法核准时的既有拒绝原因
+    reason          TEXT,                         -- 运营方填写的改签原因（可选）
+    rescheduled_at  TEXT    NOT NULL
+);
+-- 当前生效归属取"最近一次成功改签"：按 verification + 倒序 id 命中
+CREATE INDEX IF NOT EXISTS idx_reschedules_verification
+    ON reschedules (verification_id, decision, id);
+CREATE INDEX IF NOT EXISTS idx_reschedules_key
+    ON reschedules (idempotency_key, id);
 """
 
 # Columns added after the initial release; applied lazily so databases

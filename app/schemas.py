@@ -198,6 +198,39 @@ class BatchVerificationOut(VerificationOut):
     index: int = Field(description="该项在提交批次中的输入位置（从 0 开始）")
 
 
+class LastRescheduleBrief(BaseModel):
+    id: int
+    operation_key: str
+    from_start_time: str
+    to_start_time: str
+    from_license_id: Optional[int]
+    to_license_id: Optional[int]
+    from_pool_id: Optional[int]
+    to_pool_id: Optional[int]
+    rescheduled_at: str
+
+
+class CurrentVerificationOut(VerificationOut):
+    """GET /verifications 视图：顶层为**当前排片**（可被改签更新）。
+
+    与首次核验响应相比，顶层 start_time/license_id/pool_id/remaining_quota/
+    pool_remaining_quota 表示改签后的当前生效值；另以 original_* 暴露原核验
+    不可变快照，并给出 rescheduled/reschedule_count/last_reschedule。
+    decision/reject_reason/cancellation 语义不变。
+    """
+
+    rescheduled: bool = Field(description="该场次是否有过成功改签")
+    reschedule_count: int = Field(description="成功改签次数")
+    original_start_time: str = Field(description="原核验时的开场时刻（不可变快照）")
+    original_license_id: Optional[int] = Field(description="原核验命中的授权 id（不可变快照）")
+    original_pool_id: Optional[int] = Field(description="原核验消耗的池 id（不可变快照）")
+    original_remaining_quota: Optional[int] = Field(description="原核验扣减后的授权剩余快照")
+    original_pool_remaining_quota: Optional[int] = Field(description="原核验扣减后的池剩余快照")
+    last_reschedule: Optional[LastRescheduleBrief] = Field(
+        description="最近一次成功改签摘要；从未改签为 null"
+    )
+
+
 class BatchVerifyResponse(BaseModel):
     count: int = Field(description="本批核验项数（等于 items 长度）")
     results: list[BatchVerificationOut] = Field(
@@ -215,7 +248,6 @@ class CancelRequest(BaseModel):
             raise ValueError("reason must not be blank")
         return value
 
-
 class CancelOut(BaseModel):
     id: int = Field(description="取消记录编号")
     idempotency_key: str = Field(description="原核验幂等键")
@@ -226,6 +258,60 @@ class CancelOut(BaseModel):
     cancelled_at: str = Field(description="取消登记时间（UTC）")
     replay: bool = Field(
         description="true 表示重复提交同一取消，返回首次记录，未重复释放额度"
+    )
+
+
+# ----------------------------------------------------------------------
+# 排片改签（reschedule）
+# ----------------------------------------------------------------------
+class RescheduleRequest(BaseModel):
+    new_start_time: datetime = Field(
+        description=(
+            "新开场时间，ISO-8601；同一影片与场馆，须晚于当前时刻且不同于"
+            "当前排片。不带时区时按 UTC 处理。"
+        ),
+        examples=["2030-06-05T21:30:00Z"],
+    )
+    operation_key: str = Field(
+        min_length=1, max_length=128,
+        description="改签操作键；同键同内容重放不重复迁移，同键异内容 409",
+        examples=["screening-0001-move-1"],
+    )
+    reason: Optional[str] = Field(
+        default=None, max_length=500,
+        description="可选改签原因（仅记录，不参与判定）",
+        examples=["导演行程调整，顺延一天"],
+    )
+
+
+class RescheduleOut(BaseModel):
+    id: int = Field(description="改签记录编号")
+    idempotency_key: str = Field(description="原核验幂等键")
+    verification_id: int = Field(description="对应核验流水 id")
+    operation_key: str = Field(description="本次改签操作键")
+    film_id: str
+    venue_id: str
+    from_start_time: str = Field(description="改签前的当前开场时刻（UTC）")
+    to_start_time: str = Field(description="请求的新开场时刻（UTC；被拒也记录）")
+    decision: str = Field(description="approved=改签成功并迁移占用；rejected=新时间无法核准，排片与占用不变")
+    from_license_id: Optional[int] = Field(description="释放一次占用的授权 id")
+    to_license_id: Optional[int] = Field(description="新占用一次的授权 id；被拒为 null")
+    from_pool_id: Optional[int] = Field(description="释放一次占用的共享池 id；未绑池为 null")
+    to_pool_id: Optional[int] = Field(description="新占用一次的共享池 id；未绑池/被拒为 null")
+    reject_reason: Optional[str] = Field(
+        description="新时间无法核准时的既有拒绝原因：NO_LICENSE / TIME_OUT_OF_WINDOW / "
+                    "LICENSE_REVOKED / LICENSE_SUSPENDED / QUOTA_EXHAUSTED / POOL_EXHAUSTED；成功为 null"
+    )
+    remaining_quota: Optional[int] = Field(
+        description="新授权占用后的自身剩余；被拒为 null"
+    )
+    pool_remaining_quota: Optional[int] = Field(
+        description="新池占用后的剩余；未绑池/被拒为 null"
+    )
+    reason: Optional[str] = Field(description="运营方填写的改签原因")
+    rescheduled_at: str = Field(description="改签登记时间（UTC）")
+    replay: bool = Field(
+        description="true 表示同操作键同内容重放，返回首次记录，未重复迁移"
     )
 
 
