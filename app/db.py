@@ -96,6 +96,29 @@ CREATE TABLE IF NOT EXISTS redemptions (
     venue_id        TEXT    NOT NULL,             -- 核销场馆编号（须与核准场馆一致）
     redeemed_at     TEXT    NOT NULL
 );
+
+-- 改签历史：运营方凭原核验幂等键 + 改签操作键，把尚未开场、未取消、
+-- 未领开场码的核准场次改至同影片同场馆的新开场时间。每次成功改签落一行
+-- （from/to 排片与授权、池绑定），核验流水行的 start_time/license_id/pool_id
+-- 随当前排片更新，原核验决定与扣减快照不回写；operation_key 唯一约束兜底
+-- 并发与重放：同键同内容重放不重复迁移，同键异内容 409。
+CREATE TABLE IF NOT EXISTS reschedules (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id INTEGER NOT NULL REFERENCES verifications (id),
+    idempotency_key TEXT    NOT NULL,             -- 冗余原核验幂等键，便于按键查询
+    operation_key   TEXT    NOT NULL UNIQUE,      -- 改签操作键（幂等）
+    from_start_time TEXT    NOT NULL,             -- 改签前排片，canonical UTC ISO-8601
+    to_start_time   TEXT    NOT NULL,             -- 改签后排片，canonical UTC ISO-8601
+    from_license_id INTEGER NOT NULL REFERENCES licenses (id),
+    to_license_id   INTEGER NOT NULL REFERENCES licenses (id),
+    from_pool_id    INTEGER REFERENCES quota_pools (id),
+    to_pool_id      INTEGER REFERENCES quota_pools (id),
+    rescheduled_at  TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reschedules_verification
+    ON reschedules (verification_id, id);
+CREATE INDEX IF NOT EXISTS idx_reschedules_key
+    ON reschedules (idempotency_key, id);
 """
 
 # Columns added after the initial release; applied lazily so databases

@@ -230,6 +230,40 @@ class CancelOut(BaseModel):
 
 
 # ----------------------------------------------------------------------
+# 场次改签（同影片同场馆，仅移动开场时间）
+# ----------------------------------------------------------------------
+class RescheduleRequest(BaseModel):
+    operation_key: str = Field(
+        min_length=1, max_length=128,
+        description="改签操作幂等键；同键同内容重放返回首次记录，同键异内容 409",
+        examples=["resched-20261005-0001"],
+    )
+    new_start_time: datetime = Field(
+        description="新开场时间，ISO-8601；不带时区按 UTC 处理；须晚于当前时刻且不同于当前排片",
+        examples=["2026-10-06T19:30:00Z"],
+    )
+
+
+class RescheduleOut(BaseModel):
+    id: int = Field(description="改签记录编号")
+    idempotency_key: str = Field(description="原核验幂等键")
+    operation_key: str = Field(description="本次改签的操作幂等键")
+    verification_id: int = Field(description="被改签的核验流水 id")
+    film_id: str = Field(description="场次影片（改签不变）")
+    venue_id: str = Field(description="场次场馆（改签不变）")
+    from_start_time: str = Field(description="改签前的开场时间（UTC）")
+    to_start_time: str = Field(description="改签后的开场时间（UTC），即当前排片")
+    from_license_id: int = Field(description="释放一次已用次数的原授权 id")
+    to_license_id: int = Field(description="新增一次已用次数的新授权 id")
+    from_pool_id: Optional[int] = Field(description="同步释放一次的共享池 id；原授权未绑池为 null")
+    to_pool_id: Optional[int] = Field(description="同步新增一次的共享池 id；新授权未绑池为 null")
+    rescheduled_at: str = Field(description="改签登记时间（UTC）")
+    replay: bool = Field(
+        description="true 表示同操作键同内容重放，返回首次记录，未重复迁移"
+    )
+
+
+# ----------------------------------------------------------------------
 # 一次性开场码领取 / 状态查询 / 场馆核销
 # ----------------------------------------------------------------------
 class OpeningCodeStatusOut(BaseModel):

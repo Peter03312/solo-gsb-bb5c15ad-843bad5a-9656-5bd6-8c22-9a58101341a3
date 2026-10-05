@@ -32,6 +32,12 @@ REDEEM_REASON_VENUE_MISMATCH = "VENUE_MISMATCH"  # 核销场馆与核准场馆�
 REDEEM_REASON_TOO_EARLY = "REDEMPTION_TOO_EARLY"  # 早于计划开场时刻
 REDEEM_REASON_WINDOW_CLOSED = "REDEMPTION_WINDOW_CLOSED"  # 超过开场后 30 分钟
 
+# 改签的业务错误码（422，排片与占用保持不变）
+RESCHEDULE_REASON_CODE_ISSUED = "OPENING_CODE_ALREADY_ISSUED"  # 已领开场码，不可改签
+RESCHEDULE_REASON_NOT_IN_FUTURE = "NEW_START_NOT_IN_FUTURE"  # 新开场时间须晚于当前时刻
+RESCHEDULE_REASON_UNCHANGED = "NEW_START_UNCHANGED"  # 新开场时间与当前排片相同
+RESCHEDULE_REASON_REJECTED = "RESCHEDULE_REJECTED"  # 按新时间重新判定无法核准（附既有拒绝原因）
+
 # 核销窗口：自计划开场时刻起 30 分钟，左闭右开 [start, start+30min)
 REDEMPTION_WINDOW = timedelta(minutes=30)
 
@@ -133,9 +139,12 @@ class UnprocessableError(Exception):
     """422 — semantically invalid request that passes schema validation,
     e.g. binding a license to a missing pool or to a pool of another film."""
 
-    def __init__(self, message: str, code: str):
+    def __init__(self, message: str, code: str,
+                 extra: Optional[dict] = None):
         super().__init__(message)
         self.code = code
+        # 附加到错误响应体的额外字段（如改签被拒时的既有 reject_reason）
+        self.extra = extra or {}
 
 
 def _hash_request(film_id: str, venue_id: str, start_iso: str) -> str:
@@ -351,6 +360,61 @@ def _opening_status_out(row: Optional[sqlite3.Row], key: str,
             else None
         ),
     }
+
+
+# 改签历史查询：联出影片与场馆（改签不改变影片/场馆，取自核验流水）。
+_RESCHEDULE_SELECT = """
+SELECT
+    rs.*,
+    v.film_id AS film_id,
+    v.venue_id AS venue_id
+FROM reschedules rs
+JOIN verifications v ON v.id = rs.verification_id
+"""
+
+
+def _reschedule_out(row: sqlite3.Row, replay: bool) -> dict:
+    """One reschedule history record (a successful migration)."""
+    return {
+        "id": row["id"],
+        "idempotency_key": row["idempotency_key"],
+        "operation_key": row["operation_key"],
+        "verification_id": row["verification_id"],
+        "film_id": row["film_id"],
+        "venue_id": row["venue_id"],
+        "from_start_time": row["from_start_time"],
+        "to_start_time": row["to_start_time"],
+        "from_license_id": row["from_license_id"],
+        "to_license_id": row["to_license_id"],
+        "from_pool_id": row["from_pool_id"],
+        "to_pool_id": row["to_pool_id"],
+        "rescheduled_at": row["rescheduled_at"],
+        "replay": replay,
+    }
+
+
+def _suspended_license_ids(conn: sqlite3.Connection, candidates: list,
+                           start_iso: str) -> set:
+    """Licenses (among ``candidates``) suspended at ``start_iso``.
+
+    Read inside the same IMMEDIATE transaction as the decision, so a
+    suspension insert concurrent with the decision either commits before
+    the transaction starts (fully visible) or waits until it ends (fully
+    absent).  Half-open union: the slot is covered when
+    ``suspend_from <= t < suspend_to``.
+    """
+    if not candidates:
+        return set()
+    placeholders = ",".join("?" for _ in candidates)
+    hit_rows = conn.execute(
+        f"""
+        SELECT DISTINCT license_id FROM suspensions
+        WHERE license_id IN ({placeholders})
+          AND suspend_from <= ? AND ? < suspend_to
+        """,
+        [c["id"] for c in candidates] + [start_iso, start_iso],
+    ).fetchall()
+    return {row["license_id"] for row in hit_rows}
 
 
 def _decide(candidates: list, start_iso: str, suspended_ids: Optional[set] = None):
@@ -826,20 +890,8 @@ class Store:
         # Suspensions are read inside the same IMMEDIATE transaction
         # as the decision, so an insert concurrent with this verify
         # either commits before the transaction starts (fully visible)
-        # or waits until it ends (fully absent).  Half-open union:
-        # the slot is covered when suspend_from <= t < suspend_to.
-        suspended_ids: set = set()
-        if candidates:
-            placeholders = ",".join("?" for _ in candidates)
-            hit_rows = conn.execute(
-                f"""
-                SELECT DISTINCT license_id FROM suspensions
-                WHERE license_id IN ({placeholders})
-                  AND suspend_from <= ? AND ? < suspend_to
-                """,
-                [c["id"] for c in candidates] + [start_iso, start_iso],
-            ).fetchall()
-            suspended_ids = {row["license_id"] for row in hit_rows}
+        # or waits until it ends (fully absent).
+        suspended_ids = _suspended_license_ids(conn, candidates, start_iso)
 
         (
             decision, license_id, pool_id, reason,
@@ -1014,6 +1066,236 @@ class Store:
                 except sqlite3.Error:
                     pass
                 raise
+
+    # ------------------------------------------------------------------
+    # reschedules (move an approved session to a new start time)
+    # ------------------------------------------------------------------
+    def reschedule_verification(
+        self,
+        idempotency_key: str,
+        *,
+        operation_key: str,
+        new_start_time: datetime,
+    ) -> dict:
+        """Reschedule an approved session to a new start time (idempotent).
+
+        Eligibility mirrors the stricter claim gate: the verification must
+        be approved, not cancelled, **without a claimed opening code** and
+        still before its (current) planned start; the new start must be
+        later than now and differ from the current schedule.  Film and
+        venue never change — only the start time moves.
+
+        The licence/pool decision is **re-evaluated at the new start time**
+        (revocations, suspensions and pool caps all apply afresh) with the
+        session's own current occupation excluded from the live counters,
+        so the unit it is about to release can be re-consumed by itself.
+        When the new slot cannot be approved, a 422 carrying the legacy
+        ``reject_reason`` is raised and neither the schedule nor any
+        occupation changes.  On success the verification row's
+        ``start_time``/``license_id``/``pool_id`` move to the new values —
+        the derived live counters thereby release the old licence/pool once
+        and consume the new ones once — while the original decision and
+        quota snapshots stay untouched; a history row is appended to
+        ``reschedules`` so both the trail and the current schedule remain
+        queryable.
+
+        The whole check-evaluate-update-insert runs inside one
+        ``BEGIN IMMEDIATE`` transaction, serialised against concurrent
+        verifications, cancellations, claims and other reschedules by the
+        SQLite write lock; the ``UNIQUE`` constraint on
+        ``reschedules.operation_key`` is the final guard, so a retried
+        operation can never migrate twice and concurrent decisions never
+        oversell or double-release.  Re-submitting the same operation key
+        with the same content returns the first record (``replay=True``);
+        the same key with different content conflicts (409).
+        """
+        new_iso = to_iso(new_start_time)
+        with self._connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                verification = conn.execute(
+                    "SELECT * FROM verifications WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if verification is None:
+                    conn.execute("ROLLBACK")
+                    raise NotFoundError(
+                        f"verification '{idempotency_key}' not found"
+                    )
+
+                existing = conn.execute(
+                    _RESCHEDULE_SELECT + " WHERE rs.operation_key = ?",
+                    (operation_key,),
+                ).fetchone()
+                if existing is not None:
+                    conn.execute("COMMIT")
+                    if (existing["idempotency_key"] != idempotency_key
+                            or existing["to_start_time"] != new_iso):
+                        raise ConflictError(
+                            "reschedule operation key "
+                            f"'{operation_key}' was already used with a "
+                            "different request payload",
+                            existing=_reschedule_out(existing, replay=True),
+                        )
+                    return _reschedule_out(existing, replay=True)
+
+                if verification["decision"] != DECISION_APPROVED:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"verification '{idempotency_key}' was rejected and "
+                        "cannot be rescheduled",
+                        code=CODE_REASON_NOT_APPROVED,
+                    )
+                cancelled = conn.execute(
+                    "SELECT 1 FROM cancellations WHERE verification_id = ?",
+                    (verification["id"],),
+                ).fetchone()
+                if cancelled is not None:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"screening '{idempotency_key}' is cancelled and "
+                        "cannot be rescheduled",
+                        code=CODE_REASON_CANCELLED,
+                    )
+                claimed = conn.execute(
+                    "SELECT 1 FROM opening_codes WHERE verification_id = ?",
+                    (verification["id"],),
+                ).fetchone()
+                if claimed is not None:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"screening '{idempotency_key}' has claimed its "
+                        "opening code and cannot be rescheduled",
+                        code=RESCHEDULE_REASON_CODE_ISSUED,
+                    )
+                now = now_iso()
+                # 仅尚未开场的场次可改签；开始时间已过（含恰在此刻）一律拒绝
+                if verification["start_time"] <= now:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"screening '{idempotency_key}' has already started "
+                        "and cannot be rescheduled",
+                        code=CODE_REASON_ALREADY_STARTED,
+                    )
+                # 新开场时间须晚于当前时刻
+                if new_iso <= now:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        "the new start time must be later than now",
+                        code=RESCHEDULE_REASON_NOT_IN_FUTURE,
+                    )
+                # 新开场时间须不同于当前排片
+                if new_iso == verification["start_time"]:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        "the new start time equals the current schedule",
+                        code=RESCHEDULE_REASON_UNCHANGED,
+                    )
+
+                # 按新时间重新判定：授权选择、撤销、暂停与共享池规则与核验
+                # 完全一致；本场次的当前占用先从实时计数中剔除（本次释放后
+                # 的可用额度可参与判定），sqlite3.Row 不可变，转为 dict 调整。
+                rows = conn.execute(
+                    _LICENSE_SELECT + """
+                    WHERE l.film_id = ? AND l.venue_id = ?
+                    ORDER BY l.valid_to ASC, l.id ASC
+                    """,
+                    (verification["film_id"], verification["venue_id"]),
+                ).fetchall()
+                candidates = []
+                for row in rows:
+                    cand = dict(row)
+                    if (verification["license_id"] is not None
+                            and cand["id"] == verification["license_id"]):
+                        cand["used_sessions"] -= 1
+                    if (verification["pool_id"] is not None
+                            and cand["pool_id"] == verification["pool_id"]):
+                        cand["pool_used_sessions"] -= 1
+                    candidates.append(cand)
+                suspended_ids = _suspended_license_ids(conn, candidates,
+                                                       new_iso)
+                (
+                    decision, license_id, pool_id, reason,
+                    _remaining, _pool_remaining,
+                ) = _decide(candidates, new_iso, suspended_ids)
+                if decision != DECISION_APPROVED:
+                    # 无法核准：返回既有拒绝原因，排片与占用一律不变
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"screening '{idempotency_key}' cannot be "
+                        f"rescheduled: {reason}",
+                        code=RESCHEDULE_REASON_REJECTED,
+                        extra={"reject_reason": reason},
+                    )
+
+                # 迁移当前排片与授权/池绑定：实时计数随之旧放新占各一次；
+                # 原核验决定与扣减快照字段不回写。
+                conn.execute(
+                    """
+                    UPDATE verifications
+                    SET start_time = ?, license_id = ?, pool_id = ?
+                    WHERE id = ?
+                    """,
+                    (new_iso, license_id, pool_id, verification["id"]),
+                )
+                rescheduled_at = now_iso()
+                cur = conn.execute(
+                    """
+                    INSERT INTO reschedules
+                        (verification_id, idempotency_key, operation_key,
+                         from_start_time, to_start_time,
+                         from_license_id, to_license_id,
+                         from_pool_id, to_pool_id, rescheduled_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (verification["id"], idempotency_key, operation_key,
+                     verification["start_time"], new_iso,
+                     verification["license_id"], license_id,
+                     verification["pool_id"], pool_id, rescheduled_at),
+                )
+                conn.execute("COMMIT")
+                return {
+                    "id": cur.lastrowid,
+                    "idempotency_key": idempotency_key,
+                    "operation_key": operation_key,
+                    "verification_id": verification["id"],
+                    "film_id": verification["film_id"],
+                    "venue_id": verification["venue_id"],
+                    "from_start_time": verification["start_time"],
+                    "to_start_time": new_iso,
+                    "from_license_id": verification["license_id"],
+                    "to_license_id": license_id,
+                    "from_pool_id": verification["pool_id"],
+                    "to_pool_id": pool_id,
+                    "rescheduled_at": rescheduled_at,
+                    "replay": False,
+                }
+            except (NotFoundError, ConflictError, UnprocessableError):
+                raise
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def list_reschedules(self, idempotency_key: str) -> list:
+        """Reschedule history of one session, oldest first (404 on unknown key)."""
+        with self._connection() as conn:
+            verification = conn.execute(
+                "SELECT id FROM verifications WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if verification is None:
+                raise NotFoundError(
+                    f"verification '{idempotency_key}' not found"
+                )
+            rows = conn.execute(
+                _RESCHEDULE_SELECT + " WHERE rs.idempotency_key = ?"
+                " ORDER BY rs.id ASC",
+                (idempotency_key,),
+            ).fetchall()
+        return [_reschedule_out(r, replay=False) for r in rows]
 
     # ------------------------------------------------------------------
     # one-time opening codes and venue redemption

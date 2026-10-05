@@ -23,6 +23,8 @@ from .schemas import (
     PoolOut,
     RedeemRequest,
     RedemptionOut,
+    RescheduleOut,
+    RescheduleRequest,
     RevokeOut,
     RevokeRequest,
     SuspensionCreate,
@@ -72,8 +74,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.4.0",
-        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消与一次性开场码领取/核销",
+        version="1.5.0",
+        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯、已核准场次取消、一次性开场码领取/核销与场次改签",
         lifespan=lifespan,
     )
     app.state.store = store
@@ -96,7 +98,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     async def _unprocessable_handler(request: Request, exc: UnprocessableError):
         return JSONResponse(
             status_code=422,
-            content={"detail": str(exc), "code": exc.code},
+            content={"detail": str(exc), "code": exc.code, **exc.extra},
         )
 
     # ------------------------------------------------------------------
@@ -106,7 +108,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def root():
         return {
             "service": "film-festival-licensing",
-            "version": "1.4.0",
+            "version": "1.5.0",
             "docs": "/docs",
             "health": "/health",
         }
@@ -329,6 +331,43 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
           同一键但取消原因不同返回 409。
         """
         return store.cancel_verification(idempotency_key, reason=body.reason)
+
+    # ------------------------------------------------------------------
+    # reschedules (move an approved session to a new start time)
+    # ------------------------------------------------------------------
+    @app.post(
+        "/verifications/{idempotency_key}/reschedule",
+        response_model=RescheduleOut,
+        tags=["verifications"],
+    )
+    def reschedule_verification(idempotency_key: str, body: RescheduleRequest):
+        """凭原核验幂等键 + 改签操作键，把核准场次改至同影片同场馆的新开场时间。
+
+        - 仅已核准（approved）、未取消、未领开场码且尚未开场的场次可改签；
+          未知键 404，已拒绝/已取消/已领码/已开场 422，排片与占用均不变；
+        - 新开场时间须晚于当前时刻且不同于当前排片（否则 422）；
+        - 每次改签按新时间重新判定授权、暂停、撤销及所绑共享池额度，本场次
+          的当前占用先释放、可参与本次判定；无法核准时返回 422
+          ``RESCHEDULE_REJECTED`` 并附既有 ``reject_reason``，排片与占用不变；
+        - 成功后原授权及池占用各释放一次、新授权及池占用各增加一次，核验流水
+          的当前排片随之更新，原核验决定与扣减快照保持原样，改签历史落表可查；
+        - 同操作键同内容重放返回首次记录（replay=true），不重复迁移；
+          同操作键异内容返回 409。
+        """
+        return store.reschedule_verification(
+            idempotency_key,
+            operation_key=body.operation_key,
+            new_start_time=body.new_start_time,
+        )
+
+    @app.get(
+        "/verifications/{idempotency_key}/reschedules",
+        response_model=list[RescheduleOut],
+        tags=["verifications"],
+    )
+    def list_reschedules(idempotency_key: str):
+        """列出某场次全部改签历史（按改签次序）；未知幂等键返回 404。"""
+        return store.list_reschedules(idempotency_key)
 
     # ------------------------------------------------------------------
     # one-time opening codes (operator claim / status) and venue redemption
